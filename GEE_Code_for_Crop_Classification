@@ -1,0 +1,439 @@
+var id = "黑龙江省"
+var provincesShapefile = ee.FeatureCollection("users/hczhang10052/SoyProduct/China");
+var roi = provincesShapefile.filterMetadata('name', 'equals', id)
+
+var year1 = 2019 // year of processing
+var startDate = year1+'-5-01'
+var endDate = year1+'-11-15'
+var ROI=roi
+
+//Step1: Feature compute
+//part1  EVI phase amplitud--------------------------------------------------------------------
+var timeField = 'system:time_start';
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = ee.Number(2).pow(10).int();
+  var cirrusBitMask = ee.Number(2).pow(11).int();
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(
+             qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000).copyProperties(image, ['system:time_start']);
+}
+var addVariables = function(image) {
+// Compute time in fractional years since the epoch.
+var date = ee.Date(image.get(timeField));
+var years = date.difference(ee.Date('1970-01-01'), 'year');
+// Return the image with the added bands.
+return image
+// Add a time band.
+.addBands(ee.Image(years).rename('t'))
+.float()
+// Add a constant band.
+.addBands(ee.Image.constant(1));
+};
+var S2 = ee.ImageCollection('COPERNICUS/S2_SR')  
+                        .filterDate(startDate,endDate)
+                        .filterBounds(ROI)
+                        .map(maskS2clouds)
+                        .map(addVariables)
+
+var evi=S2.map(function(image) {
+  var evi = image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      'NIR': image.select('B8'),
+      'RED': image.select('B4'),
+      'BLUE': image.select('B2')
+}).rename('EVI');
+var nir=image.select('B8')
+var red=image.select('B4')
+var NDVI=nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+  return image.addBands(evi).addBands(NDVI);
+});                  
+
+var NDVIPre = evi.filterDate(startDate,'2020-8-1').select('NDVI').median().rename('NDVIPre')
+var NDVIPeak = evi.filterDate('2020-8-1','2020-9-1').select('NDVI').median().rename('NDVIPeak')
+var NDVIPost = evi.filterDate('2020-9-1','2020-10-1').select('NDVI').median().rename('NDVIPost')
+
+
+// List of the independent variable names
+var independents = ee.List(['constant', 't']);
+// Name of the dependent variable.
+var dependent = ee.String('EVI');
+// Compute a linear trend.  This will have two bands: 'residuals' and
+// a 2x1 band called coefficients (columns are for dependent variables).
+var trend = evi.select(independents.add(dependent))
+.reduce(ee.Reducer.linearRegression(independents.length(), 1));
+// Map.addLayer(trend, {}, 'trend array image');
+// Flatten the coefficients into a 2-band image
+var coefficients = trend.select('coefficients')
+.arrayProject([0])
+.arrayFlatten([independents]);
+// Compute a de-trended series.
+var detrended = evi.map(function(image) {
+return image.select(dependent).subtract(
+image.select(independents).multiply(coefficients).reduce('sum'))
+.rename(dependent)
+.copyProperties(image, [timeField]);
+});
+// Plot the detrended results.
+/*var detrendedChart = ui.Chart.image.series(detrended, ROI, null, 10)
+.setOptions({
+title: 'Detrended S2 time series at ROI',
+lineWidth: 1,
+pointSize: 3,
+maxPixels:10000000000
+});
+print(detrendedChart); 2*/
+// Use these independent variables in the harmonic regression.
+
+var harmonicIndependents = ee.List(['constant', 't', 'cos', 'sin','cos2','sin2']);
+// Add harmonic terms as new image bands.
+var harmonicLandsat = evi.map(function(image) {
+var timeRadians = image.select('t').multiply(2 * Math.PI);
+return image
+.addBands(timeRadians.cos().rename('cos'))
+.addBands(timeRadians.sin().rename('sin'))
+.addBands(timeRadians.multiply(2).cos().rename('cos2'))
+.addBands(timeRadians.multiply(2).sin().rename('sin2'));
+});
+
+var harmonicTrend = harmonicLandsat
+.select(harmonicIndependents.add(dependent))
+// The output of this reducer is a 4x1 array image.
+.reduce(ee.Reducer.linearRegression({
+numX: harmonicIndependents.length(),
+numY: 1
+}));
+// Turn the array image into a multi-band image of coefficients.
+var harmonicTrendCoefficients = harmonicTrend.select('coefficients')
+.arrayProject([0])
+.arrayFlatten([harmonicIndependents]);
+// Compute fitted values.
+var fittedHarmonic = harmonicLandsat.map(function(image) {
+return image.addBands(
+image.select(harmonicIndependents)
+.multiply(harmonicTrendCoefficients)
+.reduce('sum')
+.rename('fitted'));
+});
+
+// Compute phase and amplitude.
+var phase1 = harmonicTrendCoefficients.select('sin')
+.atan2(harmonicTrendCoefficients.select('cos'))
+// Scale to [0, 1] from radians.
+.unitScale(-Math.PI, Math.PI).multiply(10000).uint16().clip(roi);
+
+var amplitude1 = harmonicTrendCoefficients.select('sin')
+.hypot(harmonicTrendCoefficients.select('cos'))
+// Add a scale factor for visualization.
+.unitScale(-Math.PI, Math.PI).multiply(10000).uint16().clip(roi);
+
+var phase2 = harmonicTrendCoefficients.select('sin2')
+.atan2(harmonicTrendCoefficients.select('cos2'))
+// Scale to [0, 1] from radians.
+.unitScale(-Math.PI, Math.PI).multiply(10000).uint16().clip(roi);
+
+var amplitude2 = harmonicTrendCoefficients.select('sin2')
+.hypot(harmonicTrendCoefficients.select('cos2'))
+// Add a scale factor for visualization.
+.unitScale(-Math.PI, Math.PI).multiply(10000).uint16().clip(roi);
+//Map.addLayer(phase1.clip(roi), {}, 'phase1')
+
+var EVIxiebo=phase1.rename('phase1').addBands(amplitude1.rename('amplitude1'))
+.addBands(amplitude2.rename('amplitude2')).addBands(phase2.rename('phase2'));
+Map.addLayer(EVIxiebo, {}, "Harmonic")
+
+//part2  bands vi percentile----------------------------------------------------------
+ var S2vi = ee.ImageCollection("COPERNICUS/S2_SR")
+  .filterDate(startDate,endDate)
+  .filterBounds(roi)
+  .filterMetadata('CLOUD_COVERAGE_ASSESSMENT','less_than',70)
+  .filterMetadata('SNOW_ICE_PERCENTAGE','less_than',90).map(function(im){
+    var SCL = im.select('SCL')
+    var SCLmask = SCL.eq(1).or(SCL.eq(4)).or(SCL.eq(5)).or(SCL.eq(11)) // mask for non-valid observations
+    var snowMask = SCL.eq(11) // snow mask
+    var blue = im.select('B2').multiply(0.0001)
+    var green = im.select('B3').multiply(0.0001)
+    var red = im.select('B4').multiply(0.0001)
+    var nir = im.select('B8').multiply(0.0001)
+    var B11 = im.select('B11').multiply(0.0001)
+    var B12 = im.select('B12').multiply(0.0001)
+    var B4 = im.select('B4').multiply(0.0001)
+    var B5 =im.select('B5').multiply(0.0001)
+    var B6 =im.select('B6').multiply(0.0001)
+    var B7 =im.select('B7').multiply(0.0001)
+    var swir1 = im.select('B11').multiply(0.0001)
+    var swir = im.select('B12').multiply(0.0001)
+    var L=0.5   
+    // Generate VIs
+    var ndvi = im.normalizedDifference(['B8','B4']).rename('ndvi')
+    var evi = (ee.Image(2.5).multiply(nir.subtract(red))).divide(nir.add(red.multiply(6)).subtract(blue.multiply(7.5)).add(1)).rename('evi')
+    var gcvi = (nir.divide(green).subtract(1)).multiply(0.1).rename('gcvi')
+    var lswi = (nir.subtract(swir1)).divide(nir.add(swir1)).rename('lswi')
+    var savi =(nir.subtract(red)).divide(nir.add(red).add(L)).multiply(L+1).rename('savi')
+    var ndpi = (nir.subtract((red.multiply(0.78).add(swir1.multiply(1-0.78))))).divide(nir.add((red.multiply(0.78).add(swir1.multiply(1-0.78))))).rename("ndpi")
+    var repi= ((((B4.add(B7).divide(2)).subtract(B6)).divide(B6.subtract(B5))).multiply(35)).divide(1000).rename('repi');
+    
+    // select VI of interest
+    var bio = ndvi.addBands(evi).addBands(gcvi).addBands(lswi).addBands(savi).addBands(ndpi).addBands(repi)
+                  .addBands(B5).addBands(B6).addBands(B7).addBands(B11).addBands(B12)
+
+
+  return bio // force low values to threshMin // force snow values to threshMin 
+    .updateMask(SCLmask) // mask non-valid observations
+    .set('system:time_start', im.get('system:time_start'))
+});
+
+var vi =S2vi.select(['evi','lswi','gcvi',"savi",'repi','ndpi'])
+var bands =S2vi.select('B11','B12',"B5",'B6','B7')
+
+var P15 = vi.reduce(ee.Reducer.percentile([15])).clip(roi).multiply(10000).int16();
+var P50 = vi.reduce(ee.Reducer.percentile([50])).clip(roi).multiply(10000).int16();
+var P90 = vi.reduce(ee.Reducer.percentile([90])).clip(roi).multiply(10000).int16();
+var max = vi.reduce(ee.Reducer.max()).clip(roi).multiply(10000).int16();
+var min = vi.reduce(ee.Reducer.min()).clip(roi).multiply(10000).int16();
+var sd = vi.reduce(ee.Reducer.stdDev()).clip(roi).multiply(10000).int16();
+
+var pvi=P15.addBands(P50).addBands(P90).addBands(max).addBands(min).addBands(sd)
+
+var P15 = bands.reduce(ee.Reducer.percentile([15])).clip(roi).multiply(10000).uint16();
+var P50 = bands.reduce(ee.Reducer.percentile([50])).clip(roi).multiply(10000).uint16();
+var P90 = bands.reduce(ee.Reducer.percentile([90])).clip(roi).multiply(10000).uint16();
+var max = bands.reduce(ee.Reducer.max()).clip(roi).multiply(10000).uint16();
+var min = bands.reduce(ee.Reducer.min()).clip(roi).multiply(10000).uint16();
+var sd = bands.reduce(ee.Reducer.stdDev()).clip(roi).multiply(10000).uint16();
+
+var pbands=P15.addBands(P50).addBands(P90).addBands(max).addBands(min).addBands(sd)
+
+
+//part3  phenological characteristics----------------------------------------------------------
+var fit=fittedHarmonic.select('fitted')
+.map(function(im){
+   return im.addBands(im.metadata('system:time_start','date1'));
+});
+var leijievi=fit.select('fitted').sum().multiply(100).uint16().clip(roi);
+
+
+var threshMin = 0.12 
+var minND = fit.select('fitted').min();
+var maxND = fit.select('fitted').max();
+var amplitude = maxND.subtract(minND);
+var init = ee.Image(ee.Date((year1-1)+'-12-31').millis());
+// Compute threshold image
+var thresh15 = amplitude.multiply(0.15).add(minND).rename('bio_interp');
+var thresh50 = amplitude.multiply(0.5).add(minND).rename('bio_interp');
+var thresh95 = amplitude.multiply(0.95).add(minND).rename('bio_interp');
+// mask values below the threhsold
+var col_aboveThresh15 = fit.map(function(im){
+    var out = im.select('fitted').gte(thresh15);
+  return im.updateMask(out) // 
+    .copyProperties(im,['system:time_start']);
+});
+var col_aboveThresh50 = fit.map(function(im){
+    var out = im.select('fitted').gte(thresh50);
+  return im.updateMask(out) // 
+    .copyProperties(im,['system:time_start']);
+});
+var col_aboveThresh95 = fit.map(function(im){
+    var out = im.select('fitted').gte(thresh95);
+  return im.updateMask(out) // 
+    .copyProperties(im,['system:time_start']);
+});
+var SoS = col_aboveThresh50.reduce(ee.Reducer.firstNonNull())
+.select('date1_first').rename('SoS');//.uint16();
+var SoS_doy = SoS.subtract(init).divide(86400000).uint16().clip(roi); // convert to doy
+var SoSfit = col_aboveThresh50.reduce(ee.Reducer.firstNonNull())
+.select('fitted_first').rename('SoSfit').multiply(100).uint16().clip(roi);
+// EoS (last day below the threhsold)
+var EoS = col_aboveThresh50.reduce(ee.Reducer.lastNonNull())
+.select('date1_last').rename('EoS');//.uint16();
+var EoS_doy = EoS.subtract(init).divide(86400000).uint16().clip(roi); // convert to doy
+var EoSfit = col_aboveThresh50.reduce(ee.Reducer.lastNonNull())
+.select('date1_last').rename('EoSfit').multiply(100).uint16().clip(roi);
+var GSL=EoS_doy.subtract(SoS_doy).rename('GSL');
+var phenology=SoS_doy.addBands(EoS_doy).addBands(GSL);
+Map.addLayer(phenology,{},'phenology');
+
+// Export.image.toAsset({  
+//   image:EVIxiebo,  
+//   description:'EVIxiebo',  
+//   region: roi,  
+//   scale:10,   
+//   crs: "EPSG:4326",  
+//   assetId:"Your Asset/EVIxiebo",
+//   maxPixels:1e13  
+// });
+// Export.image.toAsset({  
+//   image:phenology,  
+//   description:'phenology',  
+//   region: roi,  
+//   scale:10,   
+//   crs: "EPSG:4326",  
+//   assetId:"Your Asset/phenology",
+//   maxPixels:1e13 
+// });
+// Export.image.toAsset({  
+//   image:pvi,  
+//   description:'pvi',  
+//   region: roi,  
+//   scale:10,   
+//   crs: "EPSG:4326",  
+//   assetId:"Your Asset/pvi",
+//   maxPixels:1e13 
+// });
+// Export.image.toAsset({  
+//   image:pbands,  
+//   description:'pbands',  
+//   region: roi,  
+//   scale:10,   
+//   crs: "EPSG:4326",  
+//   assetId:"Your Asset/pbands",
+//   maxPixels:1e13 
+// });
+
+// Export.image.toAsset({  
+//   image:leijievi,  
+//   description:'biomass',  
+//   region: roi,  
+//   scale:10,   
+//   crs: "EPSG:4326",  
+//   assetId:"Your Asset/biomass",
+//   maxPixels:1e13 
+// });
+var allFeature=EVIxiebo.addBands(phenology).addBands(pbands).addBands(pvi).addBands(leijievi)
+
+//Step2: RF classifier
+var provincesShapefile = ee.FeatureCollection("users/hczhang10052/SoyProduct/China");
+var id ="黑龙江省"
+var roi = provincesShapefile.filterMetadata('name', 'equals', id)
+
+var other=ee.FeatureCollection('projects/ee-ottohouguoyu/assets/HLJOtherSample/HLJ_OtherLandSample');
+other = other.randomColumn('random');
+
+var soysample=ee.FeatureCollection('projects/ee-ottohouguoyu/assets/HLJOtherSample/HLJ_SoySample_fromIM19')
+soysample = soysample.randomColumn('random');
+
+var othercrop=ee.FeatureCollection('projects/ee-ottohouguoyu/assets/HLJOtherSample/HLJ_NonSoySample_fromIM19')
+othercrop = othercrop.randomColumn('random');
+
+var ROI=roi;
+
+var dem = ee.Image("USGS/SRTMGL1_003").clip(ROI);
+var slope = ee.Terrain.slope(dem);
+var aspect = ee.Terrain.aspect(dem);
+
+var feature=allFeature.addBands(slope).addBands(dem).addBands(aspect)
+var bands=feature.bandNames()
+print("bands", bands)
+
+var soysample=soysample.map(function(feature){
+    var num = 1;  
+    return feature.set('CID', num);
+  });
+
+var other=other.map(function(feature){
+    var num = 0;  
+    return feature.set('CID', num);
+  })
+  
+var othercrop=othercrop.map(function(feature){
+    var num = 2;  
+    return feature.set('CID', num);
+  })
+
+var other_training=other.filter(ee.Filter.lte("random", 0.5)); 
+var other_validate=other.filter(ee.Filter.gt("random", 0.5));
+
+var soysample_training=soysample.filter(ee.Filter.lte("random", 0.5)); 
+var soysample_validate=soysample.filter(ee.Filter.gt("random", 0.5));
+
+var othercrop_training=othercrop.filter(ee.Filter.lte("random", 0.5)); 
+var othercrop_validate=othercrop.filter(ee.Filter.gt("random", 0.5)); 
+
+
+var Tsample = other_training.merge(soysample_training).merge(othercrop_training)
+var Vsample = other_validate.merge(soysample_validate).merge(othercrop_validate)
+
+
+var Tsample = feature.sampleRegions({  
+  collection: Tsample,   
+  properties: ['CID'],   
+  scale: 10,
+  tileScale:16
+});  
+
+
+var Vsample = feature.sampleRegions({  
+  collection: Vsample,   
+  properties: ['CID'],   
+  scale: 10,
+  tileScale:16
+});
+
+var classifier = ee.Classifier.smileRandomForest(500,null,10,0.5,null,0).train({  
+  features: Tsample,   
+  classProperty: "CID",  
+  inputProperties: bands  
+});
+var classified = feature.classify(classifier);  
+var trainAccuracy = classifier.confusionMatrix();  
+var resultImg = classified.clip(roi).toByte();  
+Map.addLayer(resultImg, {min: 0, max: 2, palette: ["d3d3d3","267000", "ffd300"]}, "fenleitu");
+
+var validated = Vsample.classify(classifier);  
+var testAccuracy = validated.errorMatrix("CID", "classification");  
+Export.table.toDrive({  
+  collection: ee.FeatureCollection([  
+    ee.Feature(null, {  
+      matrix: testAccuracy.array(),  
+      kappa: testAccuracy.kappa(),  
+      accuracy: testAccuracy.accuracy()  
+    }  
+  )]),  
+  description: "hunxiaojuzhen",  
+  fileFormat: "CSV"  
+});  
+print("精度",testAccuracy.accuracy() )
+print("hunx",testAccuracy.array() )
+print("Kappa",testAccuracy.kappa() )
+
+//Get the feature importance
+// Get the band names from the input dataset (image)
+
+var dict = classifier.explain();
+var importance = ee.Dictionary(dict.get('importance'))
+var keys = importance.keys().sort(importance.values()).reverse()
+var values = importance.values(keys);
+var rows = keys.zip(values).map(function(list) {
+  return {c: ee.List(list).map(function(n) { return {v: n}; })}
+})
+
+var dataTable = {
+  cols: [{id: 'band', label: 'Band', type: 'string'},
+         {id: 'importance', label: 'Importance', type: 'number'}],
+  rows: rows
+};
+
+ee.Dictionary(dataTable).evaluate(function(result) {
+  var chart = ui.Chart(result)
+    .setChartType('ColumnChart')
+    .setOptions({
+      title: 'Random Forest Band Importance',
+      legend: {position: 'none'},
+      hAxis: {title: 'Bands'},
+      vAxis: {title: 'Importance'}
+    });
+  print(chart);
+})
+
+var result=resultImg.mask(resultImg.eq(1)).clip(roi)
+
+var pixelArea = ee.Image.pixelArea().divide(10000000);
+var areas = pixelArea.multiply(result).reduceRegion({
+  reducer:ee.Reducer.sum(),
+  geometry:roi ,
+  scale: 10,
+  maxPixels:1e13
+})
+print(areas,'areas')
+
+Map.addLayer(result, {}, "大豆");

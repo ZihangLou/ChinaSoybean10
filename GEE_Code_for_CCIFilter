@@ -1,0 +1,217 @@
+var randCrop = ee.FeatureCollection("Your table's assetID")//Random crop points generated from GEE_Code_for_Random_Crop_Points
+var roi = ee.FeatureCollection("Your roi's assetID")//Region of the random crop points
+
+var year = 2019 // year of processing
+var startDate = year+'-1-01'
+var endDate = year+'-12-31'
+
+var timeField = 'system:time_start';
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = ee.Number(2).pow(10).int();
+  var cirrusBitMask = ee.Number(2).pow(11).int();
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0).and(
+             qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000).copyProperties(image, ['system:time_start']);
+}
+var addVariables = function(image) {
+// Compute time in fractional years since the epoch.
+var date = ee.Date(image.get(timeField));
+var years = date.difference(ee.Date('1970-01-01'), 'year');
+// Return the image with the added bands.
+return image
+// Add a time band.
+.addBands(ee.Image(years).rename('t'))
+.float()
+// Add a constant band.
+.addBands(ee.Image.constant(1));
+};
+
+
+var S2 = ee.ImageCollection('COPERNICUS/S2_SR')  
+                        .filterDate(startDate,endDate)
+                        .filterBounds(roi)
+                        .map(maskS2clouds)
+                        .map(addVariables)
+var evi=S2.map(function(image) {
+  var evi = image.expression(
+    '2.5 * ((NIR - RED) / (NIR + 6 * RED - 7.5 * BLUE + 1))', {
+      'NIR': image.select('B8'),
+      'RED': image.select('B4'),
+      'BLUE': image.select('B2')
+}).rename('EVI');
+  return image.addBands(evi);
+});                  
+
+// List of the independent variable names
+var independents = ee.List(['constant', 't']);
+// Name of the dependent variable.
+var dependent = ee.String('EVI');
+// Compute a linear trend.  This will have two bands: 'residuals' and
+// a 2x1 band called coefficients (columns are for dependent variables).
+var trend = evi.select(independents.add(dependent))
+.reduce(ee.Reducer.linearRegression(independents.length(), 1));
+// Map.addLayer(trend, {}, 'trend array image');
+// Flatten the coefficients into a 2-band image
+var coefficients = trend.select('coefficients')
+.arrayProject([0])
+.arrayFlatten([independents]);
+// Compute a de-trended series.
+var detrended = evi.map(function(image) {
+return image.select(dependent).subtract(
+image.select(independents).multiply(coefficients).reduce('sum'))
+.rename(dependent)
+.copyProperties(image, [timeField]);
+});
+var harmonicIndependents = ee.List(['constant', 't', 'cos', 'sin','cos2','sin2']);
+// Add harmonic terms as new image bands.
+var harmonicLandsat = evi.map(function(image) {
+var timeRadians = image.select('t').multiply(2 * Math.PI);
+return image
+.addBands(timeRadians.cos().rename('cos'))
+.addBands(timeRadians.sin().rename('sin'))
+.addBands(timeRadians.multiply(2).cos().rename('cos2'))
+.addBands(timeRadians.multiply(2).sin().rename('sin2'));
+});
+
+var harmonicTrend = harmonicLandsat
+.select(harmonicIndependents.add(dependent))
+// The output of this reducer is a 4x1 array image.
+.reduce(ee.Reducer.linearRegression({
+numX: harmonicIndependents.length(),
+numY: 1
+}));
+// Turn the array image into a multi-band image of coefficients.
+var harmonicTrendCoefficients = harmonicTrend.select('coefficients')
+.arrayProject([0])
+.arrayFlatten([harmonicIndependents]);
+// Compute fitted values.
+var fittedHarmonic = harmonicLandsat.map(function(image) {
+return image.addBands(
+image.select(harmonicIndependents)
+.multiply(harmonicTrendCoefficients)
+.reduce('sum')
+.rename('fitted'));
+});
+
+var fit=fittedHarmonic.select('fitted')
+.map(function(im){
+   return im.addBands(im.metadata('system:time_start','date1'));
+});
+var minND = fit.select('fitted').min();
+var maxND = fit.select('fitted').max();
+var maxEVI = fit.qualityMosaic('fitted')
+
+var amplitude = maxND.subtract(minND);
+var init = ee.Image(ee.Date((year-1)+'-12-31').millis());
+// Compute threshold image
+var thresh50 = amplitude.multiply(0.5).add(minND).rename('bio_interp');
+// mask values below the threhsold
+var col_aboveThresh50 = fit.map(function(im){
+    var out = im.select('fitted').gte(thresh50);
+  return im.updateMask(out) // 
+    .copyProperties(im,['system:time_start']);
+});
+
+var SoS = col_aboveThresh50.reduce(ee.Reducer.firstNonNull())
+.select('date1_first').rename('SoS');//.uint16();
+var SoS_doy = SoS.subtract(init).divide(86400000).uint16().clip(roi); // convert to doy
+
+var EoS = col_aboveThresh50.reduce(ee.Reducer.lastNonNull())
+.select('date1_last').rename('EoS');//.uint16();
+var EoS_doy = EoS.subtract(init).divide(86400000).uint16().clip(roi); // convert to doy
+
+var PoS = maxEVI.select('date1').rename('PoS');
+var PoS_doy = PoS.subtract(init).divide(86400000).uint16().clip(roi); // convert to doy
+
+
+
+var TCARIdivOSAVI = S2.map(function(image){
+  var TCARIdivOSAVI = image.expression(
+      '3*((RE1-Red)-0.2*(RE1-Green)*RE1/Red)/(1.16*(Nir-Red)/(Nir+Red+0.16))',
+      {
+        'Nir': image.select('B8').multiply(1e-4),
+        'RE1': image.select('B5').multiply(1e-4),
+        'Red':image.select('B4').multiply(1e-4),
+        'Green': image.select('B3').multiply(1e-4)
+      }
+    ).rename('TCARIdivOSAVI');
+    return image.addBands(TCARIdivOSAVI).select('TCARIdivOSAVI');
+
+})
+
+var startDay = ee.Date.fromYMD(year,1,1)
+var endDay = ee.Date.fromYMD(year+1,1,1)
+var startDoy = startDay.getRelative('day','year')
+var endDoy = endDay.advance(-1,'day').getRelative('day','year')
+var starts = ee.List.sequence(startDoy, endDoy, 10)
+var composites = ee.ImageCollection(starts.map(function(start) {
+  var doy = start
+  var filtered = TCARIdivOSAVI.filter(ee.Filter.dayOfYear(start, ee.Number(start).add(10))).median().clip(roi)
+  var bandLength = filtered.bandNames().length()
+  var mask = ee.Algorithms.If({                   // mask must be done for time band
+    condition : ee.Number(bandLength).gt(0),
+    trueCase : filtered.select('TCARIdivOSAVI').mask(),
+    falseCase : ee.Image(0).clip(roi)    
+  })
+  return filtered.addBands(ee.Image.constant(doy).rename('doy').float())
+                .updateMask(mask)
+                .set('system:time_start',ee.Date.fromYMD(year,1,1).advance(doy,'day').millis())
+                .set('doy',doy)
+                .set('length',bandLength)   
+  }));
+// Linear interpolation --------------------------------------------
+var size = composites.size()
+var LIC = composites.toList(size)
+var interpolated = ee.ImageCollection(ee.List.sequence(9,30,1).map(function(i){
+  var i = ee.Number(i)
+  var before = ee.ImageCollection.fromImages(LIC.slice(i.subtract(9),i))
+    .filter(ee.Filter.gt('length',0)).mosaic()
+  var after = ee.ImageCollection.fromImages(LIC.slice(i.add(1),i.add(10)).reverse())
+    .filter(ee.Filter.gt('length',0)).mosaic()
+  var boforeY = before.select('TCARIdivOSAVI')
+  var beforedoy = before.select('doy')
+  var afterY = after.select('TCARIdivOSAVI')
+  var afterdoy = after.select('doy')
+  var targetImg = ee.Image(LIC.get(i))
+  var currentdoy = ee.Image.constant(targetImg.get('doy')).float();
+  var Y = afterY.subtract(boforeY).divide(afterdoy.subtract(beforedoy))
+      .multiply(currentdoy.subtract(beforedoy)).add(boforeY)
+  var filledImage = ee.Image(ee.Algorithms.If({
+    condition : ee.Number(targetImg.get('length')).gt(0), 
+    trueCase : targetImg.select('TCARIdivOSAVI').unmask(Y),
+    falseCase : Y
+  }));
+  return filledImage.unmask(0).clip(roi)
+    .set('system:time_start',targetImg.get('system:time_start'),'doy',targetImg.get('doy')) // can not simply copy all properties of composites
+})) 
+
+
+var DOY = SoS_doy.addBands(EoS_doy).addBands(PoS_doy)
+randCrop = DOY.sampleRegions({
+	collection:randCrop,
+	scale:10
+})
+
+//CCI=1 represents potential soybeans, and CCI=0 represents non-potential soybeans
+randCrop = randCrop.map(function(p){
+  var SOS = ee.Number(p.get('SoS'))
+  var EOS = ee.Number(p.get('EoS'))
+  var POS = ee.Number(p.get('PoS'))
+  
+  var SOSImg = ee.Image(interpolated.filter(ee.Filter.dayOfYear(SOS, SOS.subtract(9))).first()).rename('SOS_Value')
+  var EOSImg = ee.Image(interpolated.filter(ee.Filter.dayOfYear(EOS, EOS.subtract(9))).first()).rename('EOS_Value')
+  var POSImg = ee.Image(interpolated.filter(ee.Filter.dayOfYear(POS, POS.subtract(9))).first()).rename('POS_Value')
+  var Img = POSImg.multiply(2).subtract(EOSImg).subtract(SOSImg)
+  Img = Img.rename('CCI')
+   var classProportions = Img.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: p.geometry(),
+    scale: 10,
+    maxPixels:1e13
+  });
+  var values = classProportions.values();
+  var index = ee.Algorithms.If(ee.Number(values.get(0)).lt(0), 1, 0);
+  p = p.set('CCI', index);
+  return p.select(['CCI']);
+})

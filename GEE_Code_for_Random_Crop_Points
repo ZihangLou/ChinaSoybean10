@@ -1,0 +1,55 @@
+var HLJ_Hexgon = ee.FeatureCollection("projects/ee-ottohouguoyu/assets/HLJOtherSample/HLJ_Hexgon");
+var provincesShapefile = ee.FeatureCollection("users/hczhang10052/SoyProduct/China");
+var id ="黑龙江省"
+var roi = provincesShapefile.filterMetadata('name', 'equals', id)
+
+
+var randomPoints = HLJ_Fishnet.filterBounds(roi).map(function(f){
+  return ee.FeatureCollection.randomPoints(f.geometry(), 40);
+}).flatten().filterBounds(roi);
+print(randomPoints,'randomPoints')
+
+var dataset = ee.ImageCollection("ESA/WorldCover/v100").first().clip(roi);
+Map.addLayer(dataset, {}, "ESA 10m");
+
+var treeCover = dataset.remap([10], [1], 0, 'Map').rename('tree_cover');
+var shrubland = dataset.remap([20], [1], 0, 'Map').rename('shrubland');
+var grassland = dataset.remap([30], [1], 0, 'Map').rename('grassland');
+var cropland = dataset.remap([40], [1], 0, 'Map').rename('cropland');
+var builtUp = dataset.remap([50], [1], 0, 'Map').rename('built_up');
+var bareSparse = dataset.remap([60], [1], 0, 'Map').rename('bare_sparse');
+var waterBody = dataset.remap([80], [1], 0, 'Map').rename('water_body');
+var wetland = dataset.remap([90], [1], 0, 'Map').rename('wetland');
+
+
+var binaryImages = ee.Image([cropland]);
+var keys = ["cropland"];
+
+Map.addLayer(binaryImages, {}, "cropland");
+
+var pointWithArea = randomPoints.map(function(p){
+  var buffer = p.buffer(50).geometry();
+  var classProportions = binaryImages.reduceRegion({
+    reducer: ee.Reducer.mean(),
+    geometry: buffer,
+    scale: 10,
+    tileScale: 4
+  });
+  var values = classProportions.values(keys);
+  var index = ee.Algorithms.If(ee.Number(values.get(0)).gt(0.9), 1, -1);
+  p = p.set('CID', index);
+  
+  return p;
+}).filter(ee.Filter.gte('CID', 1));
+print("cropland", pointWithArea.filter(ee.Filter.eq('CID', 1)).size());
+pointWithArea = pointWithArea;
+Map.addLayer(pointWithArea, {}, "croplandSamples");
+print(pointWithArea,'pointWithArea');
+Export.table.toAsset({
+	collection:pointWithArea,
+	description: "HLJCropLandSample",
+	assetId: "YourAsset/HLJCropLandSample",
+//	maxVertices:,
+})
+
+

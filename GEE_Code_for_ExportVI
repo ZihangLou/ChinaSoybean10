@@ -1,0 +1,186 @@
+var oeel = require('users/OEEL/lib:loadAll');
+
+/**
+ * Export time series sample data with VI.
+ *
+ * @param {string} province - Province where the sample points for time series curve calculation are located.
+ * @param {ee.FeatureCollection} table - FeatureCollection containing sample point information.
+ * @param {string} VIName - Selected vegetation index name.
+ * @param {number} year - Year in which the samples are located.
+ * @param {string} fileNamePrefix - Exported file name prefix.
+ * @param {string} folder - Export folder name.
+ */
+exports.exportVISamples = function(province, table, VIName, year, fileNamePrefix, folder) {
+  // Filter the region of interest based on the table
+  var provincesShapefile = ee.FeatureCollection("users/hczhang10052/SoyProduct/China");
+  var roi = provincesShapefile.filterMetadata('name', 'equals', province)
+  // Define the time range
+  var startDate = year + '-04-01';
+  var endDate = year + '-11-01';
+
+  var collection = ee.ImageCollection("COPERNICUS/S2_SR")
+    .filterDate(startDate, endDate)
+    .filterBounds(roi)
+    .map(rmCloud)
+    .select('B.*');
+
+  // Calculate VI for all images
+  var s2WithVI = collection.map(calculateVIs.SWIR)
+    .map(calculateVIs.REPI)
+    .map(calculateVIs.EVI)
+    .map(calculateVIs.GCVI)
+    .map(calculateVIs.LSWI)
+    .map(calculateVIs.MNDWI)
+    .map(calculateVIs.NDPI)
+    .map(calculateVIs.RENDVI)
+    .map(calculateVIs.WDRVI)
+    .map(calculateVIs.RE2)
+    .select(VIName);
+
+  // Extract GCVI values for each sample point
+  var tableWithVI = table.map(sampleVI, true);
+
+  // Export as GeoJSON
+  Export.table.toDrive({
+    collection: tableWithVI,
+    description: fileNamePrefix + "Samples" + VIName,
+    folder: folder,
+    fileNamePrefix: fileNamePrefix + "Samples" + VIName,
+    fileFormat: "GeoJSON",
+  });
+
+  /**
+   * Add VI value to each feature in the sample table.
+   * @param {ee.Feature} feature - Sample feature.
+   * @return {ee.Feature} - Feature with added VI property.
+   */
+  function sampleVI(feature) {
+    var img = s2WithVI.filterBounds(feature.geometry())
+      .sort("system:time_start")
+      .toBands();
+    var vis = img.reduceRegion({
+      reducer: ee.Reducer.mean(),
+      geometry: feature.geometry(),
+      scale: 10,
+      crs: "EPSG:4326",
+      maxPixels: 10000000,
+      tileScale: 4,
+    });
+    return feature.set(vis);
+  }
+};
+
+var calculateVIs = {
+  SWIR : function(image) {
+    var swir1 = image.expression(
+      'swir1',
+      {
+        'swir1': image.select("B11").multiply(1e-4)
+      }
+    ).rename('SWIR');
+    return image.addBands(swir1);
+  },
+  RE2 : function(image) {
+    var RE2 = image.expression(
+      'RE2',
+      {
+        'RE2': image.select("B6").multiply(1e-4)
+      }
+    ).rename('RE2');
+    return image.addBands(RE2);
+  },
+
+  GCVI : function(image) {
+    var gcvi = image.expression(
+      '(nir / green) - 1',
+      {
+        'nir': image.select('B8'),
+        'green': image.select('B3')
+      }
+    ).rename('GCVI');
+    return image.addBands(gcvi);
+  },
+  
+  EVI : function(image) {
+    var evi = image.expression(
+      '2.5 * (nir - red) / (nir + 6 * red - 7.5 * blue + 1)',
+      {
+        'nir' : image.select("B8").multiply(1e-4),
+        'red' : image.select("B4").multiply(1e-4),
+        'blue': image.select("B2").multiply(1e-4)
+      }
+    ).rename('EVI');
+    return image.addBands(evi);
+  },
+  
+  WDRVI : function(image) {
+    var wdrvi = image.expression(
+      '(0.1*nir-red)/(0.1*nir+red)',
+      {
+        'nir' : image.select("B8").multiply(1e-4),
+        'red' : image.select("B4").multiply(1e-4)
+      }
+    ).rename('WDRVI');
+    return image.addBands(wdrvi);
+  },
+  
+  REPI : function(image) {
+    var repi = image.expression(
+      '705 + 35 * (0.5 * (rg3 + red) - rg1) / (rg2 - rg1)',
+      {
+        'red' : image.select("B4").multiply(1e-4),
+        'rg1' : image.select("B5").multiply(1e-4),
+        'rg2' : image.select("B6").multiply(1e-4),
+        'rg3' : image.select("B7").multiply(1e-4)
+      }
+    ).multiply(1e-3).rename('REPI');
+    return image.addBands(repi);
+  },
+  
+  NDPI : function(image){
+    var ndpi = image.expression(
+      '(NIR - (0.78 * red + 0.22 * swir1)) / (NIR + (0.78 * red + 0.22 * swir1))',
+      {
+        'red': image.select("B4").multiply(1e-4),
+        'NIR': image.select("B8").multiply(1e-4),
+        'swir1': image.select("B11").multiply(1e-4)
+      }
+    ).rename("NDPI");
+    return image.addBands(ndpi);
+  },
+  
+  LSWI : function(image){
+    var lswi = image.expression(
+      '(NIR - swir1) / (NIR + swir1)',
+      {
+        'NIR': image.select("B8").multiply(1e-4),
+        'swir1': image.select("B11").multiply(1e-4)
+      }
+    ).rename("LSWI");
+    return image.addBands(lswi);
+  },
+  
+  MNDWI : function(image){
+    var mndwi = image.expression(
+      '(g - swir1) / (g + swir1)',
+      {
+        "g" : image.select("B3").multiply(1e-4),
+        'swir1' : image.select("B11").multiply(1e-4)
+      }).rename("MNDWI");
+      return image.addBands(mndwi);
+  },
+  
+  RENDVI : function(image){
+    var rendvi = image.normalizedDifference(['B8','B6']).toDouble().rename('RENDVI')
+    return image.addBands(rendvi);}
+};
+
+function rmCloud(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+    .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask);
+}
+

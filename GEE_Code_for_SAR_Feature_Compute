@@ -1,0 +1,383 @@
+//////////////// Functions //////////////////////////////////////////
+var addVariables = function(image) {
+// Compute time in fractional years since the epoch.
+  var date = ee.Date(image.get(timeField));
+  var years = date.difference(ee.Date('1970-01-01'), 'year');
+  var rvi = image.expression('4*vh/(vv + vh)',
+    {'vv': image.select('VV'),
+      'vh': image.select('VH')
+    }).set('system:time_start', date).rename('RVI');
+   
+  var vhDivvv = image.expression('vh/vv',
+    {'vv': image.select('VV'),
+    'vh': image.select('VH')
+    }).set('system:time_start', date).rename("VHDivVV");
+    
+  var vhAddvv = image.expression('vv+vh',
+    {'vv': image.select('VV_Norm'),
+    'vh': image.select('VH_Norm')
+    }).set('system:time_start', date).rename("VHAddVV");
+
+  // Return the image with the added bands.
+  return image
+  // Add a time band.
+  .addBands(ee.Image(years).rename('t'))
+  .float()
+  // Add a constant band.
+  .addBands(ee.Image.constant(1))
+  .addBands([rvi,vhDivvv,vhAddvv]);
+};
+
+function powerToDb(img){
+  return ee.Image(10).multiply(img.log10());
+}
+
+function dbToPower(img){
+  return ee.Image(10).pow(img.divide(10));
+}
+
+// The RL speckle filter
+function refinedLee(image) {
+  
+  var date = image.get(timeField);
+  var bandNames = image.bandNames();
+  image = dbToPower(image);
+  
+  var result = ee.ImageCollection(bandNames.map(function(b){
+    var img = image.select([b]);
+    
+    // img must be in natural units, i.e. not in dB!
+    // Set up 3x3 kernels 
+    var weights3 = ee.List.repeat(ee.List.repeat(1,3),3);
+    var kernel3 = ee.Kernel.fixed(3,3, weights3, 1, 1, false);
+  
+    var mean3 = img.reduceNeighborhood(ee.Reducer.mean(), kernel3);
+    var variance3 = img.reduceNeighborhood(ee.Reducer.variance(), kernel3);
+  
+    // Use a sample of the 3x3 windows inside a 7x7 windows to determine gradients and directions
+    var sample_weights = ee.List([[0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0], [0,1,0,1,0,1,0], [0,0,0,0,0,0,0], [0,1,0,1,0,1,0],[0,0,0,0,0,0,0]]);
+  
+    var sample_kernel = ee.Kernel.fixed(7,7, sample_weights, 3,3, false);
+  
+    // Calculate mean and variance for the sampled windows and store as 9 bands
+    var sample_mean = mean3.neighborhoodToBands(sample_kernel); 
+    var sample_var = variance3.neighborhoodToBands(sample_kernel);
+  
+    // Determine the 4 gradients for the sampled windows
+    var gradients = sample_mean.select(1).subtract(sample_mean.select(7)).abs();
+    gradients = gradients.addBands(sample_mean.select(6).subtract(sample_mean.select(2)).abs());
+    gradients = gradients.addBands(sample_mean.select(3).subtract(sample_mean.select(5)).abs());
+    gradients = gradients.addBands(sample_mean.select(0).subtract(sample_mean.select(8)).abs());
+  
+    // And find the maximum gradient amongst gradient bands
+    var max_gradient = gradients.reduce(ee.Reducer.max());
+  
+    // Create a mask for band pixels that are the maximum gradient
+    var gradmask = gradients.eq(max_gradient);
+  
+    // duplicate gradmask bands: each gradient represents 2 directions
+    gradmask = gradmask.addBands(gradmask);
+  
+    // Determine the 8 directions
+    var directions = sample_mean.select(1).subtract(sample_mean.select(4))
+                                .gt(sample_mean.select(4).subtract(sample_mean.select(7)))
+                                .multiply(1);
+    directions = directions.addBands(sample_mean.select(6).subtract(sample_mean.select(4))
+                           .gt(sample_mean.select(4).subtract(sample_mean.select(2)))
+                           .multiply(2));
+    directions = directions.addBands(sample_mean.select(3).subtract(sample_mean.select(4))
+                           .gt(sample_mean.select(4).subtract(sample_mean.select(5)))
+                           .multiply(3));
+    directions = directions.addBands(sample_mean.select(0).subtract(sample_mean.select(4))
+                           .gt(sample_mean.select(4).subtract(sample_mean.select(8)))
+                           .multiply(4));
+    // The next 4 are the not() of the previous 4
+    directions = directions.addBands(directions.select(0).not().multiply(5));
+    directions = directions.addBands(directions.select(1).not().multiply(6));
+    directions = directions.addBands(directions.select(2).not().multiply(7));
+    directions = directions.addBands(directions.select(3).not().multiply(8));
+  
+    // Mask all values that are not 1-8
+    directions = directions.updateMask(gradmask);
+  
+    // "collapse" the stack into a singe band image (due to masking, each pixel has just one value (1-8) in it's directional band, and is otherwise masked)
+    directions = directions.reduce(ee.Reducer.sum());  
+  
+    //var pal = ['ffffff','ff0000','ffff00', '00ff00', '00ffff', '0000ff', 'ff00ff', '000000'];
+    //Map.addLayer(directions.reduce(ee.Reducer.sum()), {min:1, max:8, palette: pal}, 'Directions', false);
+  
+    var sample_stats = sample_var.divide(sample_mean.multiply(sample_mean));
+  
+    // Calculate localNoiseVariance
+    var sigmaV = sample_stats.toArray().arraySort().arraySlice(0,0,5).arrayReduce(ee.Reducer.mean(), [0]);
+  
+    // Set up the 7*7 kernels for directional statistics
+    var rect_weights = ee.List.repeat(ee.List.repeat(0,7),3).cat(ee.List.repeat(ee.List.repeat(1,7),4));
+  
+    var diag_weights = ee.List([[1,0,0,0,0,0,0], [1,1,0,0,0,0,0], [1,1,1,0,0,0,0], 
+      [1,1,1,1,0,0,0], [1,1,1,1,1,0,0], [1,1,1,1,1,1,0], [1,1,1,1,1,1,1]]);
+  
+    var rect_kernel = ee.Kernel.fixed(7,7, rect_weights, 3, 3, false);
+    var diag_kernel = ee.Kernel.fixed(7,7, diag_weights, 3, 3, false);
+  
+    // Create stacks for mean and variance using the original kernels. Mask with relevant direction.
+    var dir_mean = img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel).updateMask(directions.eq(1));
+    var dir_var = img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel).updateMask(directions.eq(1));
+  
+    dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel).updateMask(directions.eq(2)));
+    dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel).updateMask(directions.eq(2)));
+  
+    // and add the bands for rotated kernels
+    for (var i=1; i<4; i++) {
+      dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+      dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), rect_kernel.rotate(i)).updateMask(directions.eq(2*i+1)));
+      dir_mean = dir_mean.addBands(img.reduceNeighborhood(ee.Reducer.mean(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+      dir_var = dir_var.addBands(img.reduceNeighborhood(ee.Reducer.variance(), diag_kernel.rotate(i)).updateMask(directions.eq(2*i+2)));
+    }
+  
+    // "collapse" the stack into a single band image (due to masking, each pixel has just one value in it's directional band, and is otherwise masked)
+    dir_mean = dir_mean.reduce(ee.Reducer.sum());
+    dir_var = dir_var.reduce(ee.Reducer.sum());
+  
+    // A finally generate the filtered value
+    var varX = dir_var.subtract(dir_mean.multiply(dir_mean).multiply(sigmaV)).divide(sigmaV.add(1.0));
+  
+    var b = varX.divide(dir_var);
+  
+    return dir_mean.add(b.multiply(img.subtract(dir_mean)))
+      .arrayProject([0])
+      // Get a multi-band image bands.
+      .arrayFlatten([['sum']])
+      .float();
+  })).toBands().rename(bandNames);
+  return powerToDb(ee.Image(result)).set('system:time_start', date);
+}
+
+function normalize(image){
+  var date = image.get(timeField);
+  var img = image.select(['VV','VH']);
+  var img_pw = ee.Image(10).pow(img.divide(10)).set('system:time_start', date);
+  img_pw = img_pw.addBands(image.select('angle'));
+
+  var VV_Norm = img_pw.expression('vv*angle',
+  {'vv':img_pw.select('VV'),
+    'angle':img_pw.select('angle')
+  }).set('system:time_start', date).rename("VV_Norm");
+  var VH_Norm = img_pw.expression('vh*angle',
+  {'vh':img_pw.select('VH'),
+    'angle':img_pw.select('angle')
+  }).set('system:time_start', date).rename("VH_Norm");
+  img_pw = img_pw.addBands([VV_Norm,VH_Norm]);
+  
+  img_pw = img_pw.select(['VV','VH', 'VV_Norm','VH_Norm'],['VV','VH', 'VV_Norm','VH_Norm']);
+  img_pw = ee.Image(10).multiply(img_pw.log10()).set('system:time_start', date);
+  return img_pw;
+}
+
+var addTimes = function(image) {
+// Compute time in fractional years since the epoch.
+var timeField = 'system:time_start';
+var date = ee.Date(image.get(timeField));
+var years = date.difference(ee.Date('1970-01-01'), 'year');
+// Return the image with the added bands.
+return image
+// Add a time band.
+.addBands(ee.Image(years).rename('t'))
+.float()
+// Add a constant band.
+.addBands(ee.Image.constant(1));
+};
+
+var id = "黑龙江省"
+var provincesShapefile = ee.FeatureCollection("users/hczhang10052/SoyProduct/China");
+var roi = provincesShapefile.filterMetadata('name', 'equals', id)
+
+var year = 2019;
+var id = 1;
+var oeel = require('users/OEEL/lib:loadAll');
+var timeField = 'system:time_start';
+
+var cropmask = CDL.mask(CDL.neq(3)).clip(roi);
+cropmask = cropmask.add(1)
+
+// Step 1: Construct feature candicates from Sentinel-1 images
+var startDate = ee.Date.fromYMD(year,5,1);
+var endDate = ee.Date.fromYMD(year,11,15);
+var bandlist=["VV","VH"];
+var S1 = ee.ImageCollection("COPERNICUS/S1_GRD")
+           .filterBounds(roi)
+           .filterDate(startDate,endDate)
+           .map(refinedLee)
+           .map(normalize)
+           .map(addVariables)
+
+/************************SAR Index************************/
+
+var bands =S1.select('RVI','VHDivVV','VHAddVV');
+
+var P15 = bands.reduce(ee.Reducer.percentile([15])).clip(roi).updateMask(cropmask).multiply(100).int16();
+var P50 = bands.reduce(ee.Reducer.percentile([50])).clip(roi).updateMask(cropmask).multiply(100).int16();
+var P90 = bands.reduce(ee.Reducer.percentile([90])).clip(roi).updateMask(cropmask).multiply(100).int16();
+var max = bands.reduce(ee.Reducer.max()).clip(roi).updateMask(cropmask).multiply(100).int16();
+var min = bands.reduce(ee.Reducer.min()).clip(roi).updateMask(cropmask).multiply(100).int16();
+var sd = bands.reduce(ee.Reducer.stdDev()).clip(roi).updateMask(cropmask).multiply(100).int16();
+//把各个百分数特征添加的一个影像里
+var pvi_SAR=P15.addBands(P50).addBands(P90).addBands(max).addBands(min).addBands(sd).updateMask(cropmask);
+
+// 选择指数
+var bands =S1.select('VV_Norm','VH_Norm');
+
+var P15 = bands.reduce(ee.Reducer.percentile([15])).clip(roi).multiply(100).int16();
+var P50 = bands.reduce(ee.Reducer.percentile([50])).clip(roi).multiply(100).int16();
+var P90 = bands.reduce(ee.Reducer.percentile([90])).clip(roi).multiply(100).int16();
+var max = bands.reduce(ee.Reducer.max()).clip(roi).multiply(100).int16();
+var min = bands.reduce(ee.Reducer.min()).clip(roi).multiply(100).int16();
+var sd = bands.reduce(ee.Reducer.stdDev()).clip(roi).multiply(100).int16();
+//把各个百分数特征添加的一个影像里
+var pbands_SAR=P15.addBands(P50).addBands(P90).addBands(max).addBands(min).addBands(sd).updateMask(cropmask);
+Map.addLayer(pbands_SAR, {}, "pbands_SAR")
+
+var SAR = pvi_SAR.addBands(pbands_SAR)
+
+Export.image.toAsset({  
+  image:pvi_SAR,  
+  description:'pvi_SAR',  
+  region: roi,  
+  scale:10,   
+  crs: "EPSG:4326",  
+  assetId:'Your assets/pvi_SAR',
+  maxPixels:1e13  
+});
+Export.image.toAsset({  
+  image:pbands_SAR,  
+  description:'pbands_SAR',  
+  region: roi,  
+  scale:10,   
+  crs: "EPSG:4326",  
+  assetId:'Your assets/pbands_SAR',
+  maxPixels:1e13  
+});
+
+/************************ SAR PCA ************************/
+var startDoy = startDate.getRelative('day','year');
+var endDoy = endDate.advance(-11,'day').getRelative('day','year');
+var starts = ee.List.sequence(startDoy, endDoy, 10);
+
+var composites = ee.ImageCollection(starts.map(function(start) {
+  var doy = start;
+  var filtered = S1.filter(ee.Filter.dayOfYear(start, ee.Number(start).add(10))).median().clip(roi)
+  var bandLength = filtered.bandNames().length()
+  var mask = ee.Algorithms.If({                   // mask must be done for time band
+    condition : ee.Number(bandLength).gt(0),
+    trueCase : filtered.select(0).mask(),
+    falseCase : ee.Image(0).clip(roi)    
+  })
+  return filtered.addBands(ee.Image.constant(doy).rename('doy').float())
+                .updateMask(cropmask)
+                .set('system:time_start',ee.Date.fromYMD(year,1,1).advance(doy,'day').millis())
+                .set('doy',doy)
+                .set('length',bandLength)
+  }));
+
+
+//主成分分析函数
+var getPrincipalComponents = function(centered, scale, region, len) {
+    // 图像转为一维数组
+    var arrays = centered.toArray();
+
+    // 计算相关系数矩阵
+    var covar = arrays.reduceRegion({
+      reducer: ee.Reducer.centeredCovariance(),
+      geometry: region,
+      scale: scale,
+      maxPixels: 1e13
+    });
+  
+    // 获取“数组”协方差结果并转换为数组。
+    // 波段与波段之间的协方差
+    var covarArray = ee.Array(covar.get('array'));
+  
+    // 执行特征分析，并分割值和向量。
+    var eigens = covarArray.eigen();
+  
+    // 特征值的P向量长度
+    var eigenValues = eigens.slice(1, 0, 1);
+    
+    //计算主成分载荷
+    var eigenValuesList = eigenValues.toList().flatten()
+    var total = eigenValuesList.reduce(ee.Reducer.sum())
+    var percentageVariance = eigenValuesList.map(function(item) {
+      return (ee.Number(item).divide(total)).multiply(100).format('%.2f')
+    })
+    
+    // print("各个主成分的所占总信息量比例", percentageVariance)  
+      
+    // PxP矩阵，其特征向量为行。
+    var eigenVectors = eigens.slice(1, 1);
+    
+    // 将图像转换为二维阵列
+    var arrayImage = arrays.toArray(1);
+    
+    //使用特征向量矩阵左乘图像阵列
+    var principalComponents = ee.Image(eigenVectors).matrixMultiply(arrayImage);
+    var getNewBandNames = function(prefix) 
+      {
+      var seq = ee.List.sequence(1, len);
+      return seq.map(function(b) {return ee.String(prefix).cat(ee.Number(b).int());});
+      };
+    // 将特征值的平方根转换为P波段图像。
+    var sdImage = ee.Image(eigenValues.abs().sqrt())
+      .arrayProject([0]).arrayFlatten([getNewBandNames('sd')]);
+      
+    //将PC转换为P波段图像，通过SD标准化。
+    principalComponents=principalComponents
+      // 抛出一个不需要的维度，[[]]->[]。
+      .arrayProject([0])
+      // 使单波段阵列映像成为多波段映像，[]->image。
+      .arrayFlatten([getNewBandNames('pc')])
+      // 通过SDs使PC正常化。
+      .divide(sdImage);
+    return principalComponents
+  };
+
+var bandlist=["VV","VH",'RVI','VHDivVV','VHAddVV'];
+var region = roi;
+var scale = 10;
+
+var PCAImg = ee.Image(bandlist.map(function(i){
+  var img = composites.select(i).toBands().updateMask(cropmask);
+  var bandNames = img.bandNames();
+  var len = bandNames.length();
+  var meanDict_max = img.reduceRegion({
+    reducer: ee.Reducer.max(),
+    geometry: roi,
+    scale: scale,
+    maxPixels: 1e13
+  });
+  var meanDict_min = img.reduceRegion({
+    reducer: ee.Reducer.min(),
+    geometry: roi,
+    scale: scale,
+    maxPixels: 1e13
+  });
+  var means_max = ee.Image.constant(meanDict_max.values(bandNames));
+  var means_min = ee.Image.constant(meanDict_min.values(bandNames));
+  var centered = (img.subtract(means_min)).divide(means_max.subtract(means_min));
+  // var centered = img;
+  var pcImage = getPrincipalComponents(centered, scale, region,len);
+  var pcImage_output =pcImage.select(['pc1', 'pc2', 'pc3'],[i+'_pc1', i+'_pc2', i+'_pc3']);
+  // var pcImage_output =pcImage.select(['pc1'],[i+'_pc1']);
+  return pcImage_output;
+}));
+
+Export.image.toAsset({  
+  image:PCAImg,  
+  description:'PCAImg',  
+  region: roi,  
+  scale:10,   
+  crs: "EPSG:4326",  
+  assetId:'Your assets/PCAImg',
+  maxPixels:1e13  
+});
+// Map.addLayer(PCAImg, {}, "PCAImg")
+
